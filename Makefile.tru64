@@ -1,0 +1,11 @@
+include Makefile.common
+
+C = cc
+
+ProCConfig = config=bconv.tru64.cfg
+#ProCDefine = define=TRU64OS
+
+FLAGS = -c -DTRU64OS
+
+tru64: getbi.o common.o
+	$(C) -L$(ORAHOME)/lib -lclntsh -o $(EXECNAME) getbi.o common.o

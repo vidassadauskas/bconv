@@ -1,0 +1,22 @@
+ProC = proc
+
+ORAHOME = ${ORACLE_HOME}
+
+EXECNAME = getbi
+
+CInclude = -I$(ORAHOME)/rdbms/demo -I$(ORAHOME)/precomp/public -I$(ORAHOME)/rdbms/public
+
+DEBUG = -DDEBUG
+
+getbi.o: getbi.c getbi.h common.h
+	$(C) $(FLAGS) $(CInclude) $(DEBUG) getbi.c
+
+common.o: common.c common.h
+	$(C) $(FLAGS) $(CInclude) $(DEBUG) common.c
+
+getbi.c: getbi.pc
+	$(ProC) $(ProCConfig) iname=getbi.pc
+
+common.c: common.pc
+	$(ProC) $(ProCConfig) iname=common.pc
+

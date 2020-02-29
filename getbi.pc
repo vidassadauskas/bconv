@@ -1,0 +1,1291 @@
+/****************************************************/
+#ifdef LINUXOS
+#include <sys/types.h>
+#include <signal.h>
+#else
+#include <sys/types.h>
+#include <signal.h>
+#endif /* LINUXOS */
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <libgen.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <strings.h>
+
+/****************************************************/
+EXEC SQL INCLUDE SQLCA;
+/*EXEC SQL INCLUDE ORATYPES;*/
+
+#include <sql2oci.h>
+#include <oci.h>
+
+#include "getbi.h"
+#include "common.h"
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Various Oracle definitions.
+**********************************************/
+/* Specifying the RELEASE_CURSOR=YES option instructs Pro*C
+ * to release resources associated with embedded SQL
+ * statements after they are executed.  This ensures that
+ * ORACLE does not keep parse locks on tables after data
+ * manipulation operations, so that subsequent data definition
+ * operations on those tables do not result in a parse-lock
+ * error.
+ */
+EXEC ORACLE OPTION (RELEASE_CURSOR=YES);
+
+
+/****************************************************/
+int main(int argc, char **argv)
+{
+  EXEC SQL BEGIN DECLARE SECTION;
+    t_cmd_params      cmd_params;
+    t_reg_params      reg_params;
+    struct sigaction  sa;
+    char              log_fn[WORK_DIR_LEN+FILENAME_LEN+1]; /* log file name */
+    int               log_fd; /* log file descriptor */
+    char              usr[USER_LEN+1] = "";
+    char              pwd[PWD_LEN+1] = "";
+    char              *usr_ptr = NULL;
+    char              *pwd_ptr = NULL;
+    sigset_t          new_mask;
+    char              *work_dir;
+    char              *dt;
+    int               retvalue; /* to store a return value */
+  EXEC SQL END DECLARE SECTION;
+
+  /* initialize cmd_params structure */
+  /* 1 - set a program name */
+  if ( strlen(PROGRAM_NAME) > FILENAME_LEN )
+  {
+    fprintf(stderr, "Program name too long.\n");
+    error_handler(-30);
+  }
+  else if ( strcpy(cmd_params.prog_name,PROGRAM_NAME) == NULL )
+  {
+    fprintf(stderr, "Error initializing program parameters.\n");
+    error_handler(1);
+  }
+  /* 2 - set a working directory */
+  /* Do not attempt to free the returned pointer.
+     The getenv subroutine returns a pointer to the user's copy of the environment (which is static),
+     until the first invocation of the putenv subroutine that adds a new environment variable.
+  */
+  work_dir = getenv("WORK_DIR");
+  if ( work_dir == NULL )
+  {
+    fprintf(stderr, "Working directory undefined.\n");
+    error_handler(-30);
+  }
+  else if ( strlen(work_dir) > WORK_DIR_LEN )
+  {
+    fprintf(stderr, "Working directory name too long.\n");
+    error_handler(-30);
+  }
+  else if ( strcpy(cmd_params.work_dir, work_dir) == NULL )
+  {
+    fprintf(stderr, "Error initializing program parameters.\n");
+    error_handler(-30);
+  }
+  /* 3 - set version info */
+  if ( strlen(VERSION) > VERSION_INFO_LEN )
+  {
+    fprintf(stderr, "Version info too long.\n");
+    error_handler(-30);
+  }
+  else if ( strcpy(cmd_params.version_info,VERSION) == NULL )
+  {
+    fprintf(stderr, "Error initializing version info.\n");
+    error_handler(1);
+  }
+   /* set remaining fields */
+  cmd_params.sleep_time = SLEEP_TIME;
+  cmd_params.chunk_size = CHUNK_SIZE;
+  cmd_params.batch_size = BATCH_SIZE;
+  cmd_params.from_cust_id = 0;
+  cmd_params.to_cust_id = 0;
+  cmd_params.processes = NO_OF_PROCESSES;
+  if ( strcpy(cmd_params.bi_date,"") == NULL )
+  {
+    fprintf(stderr, "Error initializing program parameters.\n");
+    error_handler(1);
+  }
+ /* parse parameters */
+
+#ifdef DEBUG
+  fprintf(stdout, "parse parameters...\n");
+#endif
+
+  parse_params(argc,argv,&cmd_params);
+  /* make that the program can be terminated only by TERM signal */
+
+  /* initialize a global variable */
+  sig_term = 0;
+/*#ifndef LINUXOS*/
+  /* initialize a new signal mask, include all signals... */
+  if ( sigfillset(&new_mask) != 0 )
+  {
+    fprintf(stderr, "Error initializing a new signal mask.\n");
+    error_handler(-1);
+  }
+  /* ... except TERM */
+  if ( sigdelset(&new_mask,SIGTERM) != 0 )
+  {
+    fprintf(stderr, "Error excluding SIGTERM from a new signal mask.\n");
+    error_handler(-1);
+  }
+  /* block all signals except TERM */
+  if ( sigprocmask(SIG_SETMASK, &new_mask, NULL) != 0 )
+  {
+    fprintf(stderr, "Error blocking all signals except TERM.\n");
+    error_handler(-1);
+  }
+
+  /* specify an action to be performed when the specified signal (TERM) is delivered. */
+  sa.sa_handler = signal_handler;
+  sa.sa_flags = 0;
+  if ( sigaction(SIGTERM, &sa, (struct sigaction *)0) != 0 )
+    error_handler(-2);
+  /* get a username and password */
+/*#endif*/ /* LINUXOS */
+  usr_ptr = usr;
+  pwd_ptr = pwd;
+  if ( get_usr_pwd(usr_ptr, pwd_ptr) == -1 )
+  {
+    fprintf(stderr, "Error getting username and password.\n");
+    error_handler(-30);
+  }
+
+#ifdef DEBUG
+ /* fprintf(stdout, "string: %s/%s\n",usr,pwd);
+  fprintf(stdout, "pointer: %s/%s\n",usr_ptr,pwd_ptr);*/
+#endif
+
+
+/*#ifndef LINUXOS*/
+  /* become a daemon process */
+#ifdef DEBUG
+  fprintf(stdout, "become a daemon process.\n");
+#endif /* DEBUG */
+
+  if( signal( SIGINT, SIG_IGN ) != SIG_IGN )
+    (void)signal( SIGINT, SIG_IGN );
+  if( signal( SIGKILL, SIG_IGN ) != SIG_IGN )
+    (void)signal( SIGKILL, SIG_IGN );
+  switch (fork())
+  {
+    case -1:
+    { /* error */
+      fprintf(stderr, "Error during fork.\n");
+      error_handler(-1);
+      break;
+    }
+    case 0:
+    { /* child process continues*/
+      break;
+    }
+    default:
+    { /* parent process terminates */
+      /* Exit parent process */
+      if( signal( SIGINT, SIG_DFL ) != SIG_DFL )
+        (void)signal( SIGINT, SIG_DFL );
+      if( signal( SIGKILL, SIG_DFL ) != SIG_DFL )
+        (void)signal( SIGKILL, SIG_DFL );
+      error_handler(0);
+      break;
+    }
+  }
+  /*
+  The setsid() function creates a new session when the calling process is not
+  a process group leader. The calling process then becomes the session leader
+  of this session, becomes the process leader of the new process group, and
+  has no controlling terminal. The process group ID of the calling process is
+  set equal to its process ID. The calling process becomes the only process
+  in the new process group and the only process in the new session.
+  */
+  if (setsid() == -1)
+  {
+    fprintf(stderr, "Error during setsid.\n");
+    error_handler(-1);
+  }
+/*#endif*/ /* LINUXOS */
+
+  /* get current date and time */
+  dt = now(NOW_FN_FMT);
+  /* set a log file name */
+  retvalue = snprintf(
+                      log_fn,
+                      WORK_DIR_LEN+FILENAME_LEN+1,
+                      "%s/%s/%s%s.%d.log",
+                      cmd_params.work_dir,
+                      LOG_DIR_NAME,
+                      PROGRAM_NAME,
+                      dt,
+                      getpid()
+                     );
+  /* check if setting a log file name was successfull */
+  if ( retvalue >= WORK_DIR_LEN+FILENAME_LEN+1 )
+  {
+    fprintf(stderr, "WARNING! A log file name was truncated.\n");
+  }
+  else if ( retvalue < 0 )
+  {
+    fprintf(stderr, "Error setting a log file name.\n");
+    error_handler(-13);
+  }
+  /* free memory */
+  free(dt);
+#ifdef DEBUG
+  fprintf(stdout, "log file name: %s\n", log_fn);
+#endif
+
+/*#ifndef LINUXOS*/
+  /* disable input */
+  if ( fclose( stdin ) != 0 )
+  {
+    fprintf(stderr, "Cannot close standard input.\n");
+    error_handler(-1);
+  }
+/*#endif*/ /* LINUXOS */
+
+  /* open logfile */
+  if ( (log_fd = open(log_fn, O_WRONLY | O_CREAT, 0755)) != -1)
+  {
+/*#ifndef LINUXOS*/
+    /* redirect output to log file */
+    (void)dup2(log_fd, STDOUT_FILENO);
+    (void)dup2(log_fd, STDERR_FILENO);
+    if (log_fd > 2) /* ??? */
+      (void)close(log_fd);
+/*#else
+    ;
+#endif*/ /* LINUXOS */
+  }
+  else /* error */
+  {
+    fprintf(stderr, "Cannot open a logfile.\n");
+    error_handler(-1);
+  }
+  /* connect to the database */
+
+#ifdef DEBUG
+  fprintf(stdout, "Connect to the database.\n");
+#endif
+
+  /* initialize a SQLLIB runtime context that is referenced in an EXEC SQL CONTEXT USE statement. */
+  EXEC SQL CONTEXT ALLOCATE :ctx1;
+  /* instruct the precompiler to use the specified SQLLIB runtime context on subsequent executable SQL statements. */
+  EXEC SQL CONTEXT USE :ctx1;
+  /* connect to the database */
+  do_connect(usr, pwd);
+  /* Obtain the OCI Environment handle that is associated with the desired runtime context */
+  /* it is a shared server application */
+  /* The SQLLIB library function SQLEnvGet() (SQLLIB OCI Environment Get) returns the pointer
+  to the OCI environment handle associated with a given SQLLIB runtime context. */
+  /* Description:
+       Sets oeh to the OCIEnv corresponding to the runtime context
+     Parameters:
+       rctx (IN) pointer to a SQLLIB runtime context
+       oeh (OUT) pointer to OCIEnv
+     Returns:
+       SQL_SUCCESS on success
+       SQL_ERROR on failure
+     Notes:
+       The usual error status variables in Pro*C/C++ such as SQLCA and SQLSTATE
+       will not be affected by a call to this function
+  */
+  retcode = SQLEnvGet((dvoid *)ctx1, &oeh);
+
+  /* The error handle is passed as a parameter to most OCI calls.
+  The error handle maintains information about errors that occur during an OCI operation.
+  If an error occurs in a call, the error handle can be passed to OCIErrorGet()
+  to obtain additional information about the error that occurred.
+  Allocating the error handle is one of the first steps in an OCI application
+  because most OCI calls require an error handle as one of its parameters. */
+  /* No diagnostics are available on error. This call returns OCI_SUCCESS if successful,
+  or OCI_INVALID_HANDLE if an error occurs. */
+  /* Allocate an OCI error handle using the retrieved environment handle: */
+  retcode = OCIHandleAlloc((dvoid *)oeh, (dvoid **)&err, (ub4)OCI_HTYPE_ERROR, (size_t)0, (dvoid **)0);
+
+  /* The SQLLIB library function SQLSvcCtxGet() (SQLLIB OCI Service Context Get)
+  returns the OCI service context for the Pro*C/C++ database connection.
+  The OCI service context can then be used in direct calls to OCI functions. */
+  /* Description:
+       Sets svc to the OCI Service Context corresponding to the runtime context
+     Parameters:
+       rctx (IN) = pointer to a SQLLIB runtime context
+       dbname (IN) = buffer containing the "logical" name for this connection
+       dbnamelen (IN) = length of the dbname buffer
+       svc (OUT) = address of an OCISvcCtx pointer
+     Returns:
+       SQL_SUCCESS on success
+       SQL_ERROR on failure
+     Notes:
+       1. The usual error status variables in Pro*C/C++ such as SQLCA and SQLSTATE will not be
+          affected by a call to this function
+       2. dbname is the same identifier used in an AT clause in an embedded SQL statement.
+       3. If dbname is a null pointer or dbnamelen is 0, then the default database connection is assumed,
+          as in a SQL statement with no AT clause.
+       4. A value of -1 for dbnamelen is used to indicate that dbname is a zero-terminated string.
+  */
+  /* Optionally, if needed by the OCI call you use, obtain the OCIServiceContext
+  handle using the SQLSvcCtxGet call (for shared server environment applications): */
+  retcode = SQLSvcCtxGet((dvoid *)ctx1, (text *)"", (sb4)0, &svc);
+
+
+  /* register the process in BCONV_PROC table */
+  /* initialize reg_params structure */
+  reg_params.proc_id = 0;
+  reg_params.srv_id = 0;
+  reg_params.pid = 0;
+  strcpy(reg_params.proc_name, cmd_params.prog_name);
+
+#ifdef DEBUG
+  fprintf(stdout, "Registerring the process...\n");
+#endif
+
+  do_register(&reg_params);
+  /* entering infinite loop which is interupted by receiving a TERM signal */
+  for ( ; ; )
+  {
+    /* reserve a group of documents for processing */
+    /* If there are no documents to process, i.e. no documents were reserved
+    the process sleeps for a certain duration (sleeptime) and then proceeds to termination step */
+
+#ifdef DEBUG
+    fprintf(stdout, "Reserving a batch of bill images to be processed...\n");
+#endif
+
+    if ( do_reserve(cmd_params,reg_params) == 0 )
+    {
+      /* sleeping */
+      /* but check before if a termination signal was received */
+
+#ifdef DEBUG
+      fprintf(stdout, "terminate?..\n");
+#endif
+
+      /* if a termination signal received terminate the program */
+      termination(reg_params);
+
+#ifdef DEBUG
+      fprintf(stdout, "sleeping...\n");
+#endif
+
+      if ( sleep((unsigned int)cmd_params.sleep_time) != 0 )
+      {
+        fprintf(stderr, "Error trying to sleep.\n");
+        error_handler(-24);
+      }
+    }
+    else
+    {
+      /* process the reserved documents */
+
+#ifdef DEBUG
+      fprintf(stdout, "Processing the reserved documents...\n");
+#endif
+
+      do_process(cmd_params,reg_params);
+    }
+
+#ifdef DEBUG
+    fprintf(stdout, "terminate?..\n");
+#endif
+
+    /* if a termination signal received terminate the program */
+    termination(reg_params);
+  }
+}
+
+
+/****************************************************/
+/* Opens the binary file identified by 'filename' for
+ * writing, and copies the contents of 'buf' into it.
+ * 'bufsize' should contain the size of 'buf'.
+ * Returns the number of bytes written (should be == bufsize),
+ * or -1 if there is an error.
+ */
+/****************************************************/
+ssize_t write_file(char *filename, unsigned char *buf, size_t bufsize)
+{
+  int     out_fd;        /* File descriptor for the output file. */
+  ssize_t num_written;   /* Number of bytes written. */
+
+  /* Open the file for writing.  This command replaces any existing version. */
+#ifdef LINUXOS
+  out_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+#else
+  out_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECTIO, 0755);
+#endif /* LINUXOS */
+
+  if (out_fd == -1)
+  {
+    /* Can't create the output file - return an error. */
+    fprintf(stderr, "Cannot create the output file.\n");
+    return -1;
+  }
+
+  /* Write the contents of buf to the file. */
+  num_written = write(out_fd, buf, bufsize);
+
+  /* Close the file, and return the number of bytes written. */
+  if ( close(out_fd) != 0 )
+  {
+    fprintf(stderr, "Error closing a file.\n");
+    return -1;
+  }
+  return num_written;
+}
+
+
+/****************************************************/
+/* process the reserved documents */
+/****************************************************/
+void do_process(t_cmd_params cmd_params, t_reg_params reg_params)
+{
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL BEGIN DECLARE SECTION;
+    ssize_t     num_written;   /* Number of bytes written to a file. */
+    char        *bi_extension = NULL;
+    ub2         biextlen; /* length of bi_extension field */
+    t_index_rec *index_rec_ptr = NULL;
+    char        filename[WORK_DIR_LEN+DIR_SEPARATOR_LEN+FNAME_LEN+EXT_SEPARATOR_LEN+BI_EXTENSION_LEN+1];
+    size_t      filename_len = WORK_DIR_LEN+DIR_SEPARATOR_LEN+FNAME_LEN+EXT_SEPARATOR_LEN+BI_EXTENSION_LEN;
+    char        datefmt[DATE_FMT_LEN+1];
+    char        datetimefmt[DATE_TIME_FMT_LEN+1];
+    /*EXEC SQL VAR bi_extension is string(BI_EXTENSION_LEN+1);*/
+    OCIStmt     *stmth = NULL; /* statement handle */
+    text        *stmt = (text *)"select bi_image, bi_extension\
+                           from bill_images where customer_id = :customer_id\
+                           and bi_date = to_date(:bi_date,:datefmt)\
+                           and rowid = :row_id";
+    OCIBind     *bind_cust_id_h = NULL; /* bind handler for customer id */
+    OCIBind     *bind_bi_date_h = NULL; /* bind handler for BI date */
+    OCIBind     *bind_datefmt_h = NULL; /* bind handler for date format */
+    OCIBind     *bind_row_id_h = NULL; /* bind handler for row id */
+    OCIDefine   *defn_bi_h = NULL; /* define handle for bi_image */
+    OCIDefine   *defn_bi_ext_h = NULL; /* define handle for bi_extension */
+    ub1         *bi_buf = NULL;  /* a buffer where a piece of bi_image is stored */
+    ub1         *bi_rec = NULL; /* a buffer to store the whole bi_image */
+    ub4         buflen; /* The length of a piece or bi_image. */
+    ub4         bilen; /* total length of the bi_image. */
+    ub4         bilencount; /* total length of the bi_image already fetched. */
+    ub1         piece = OCI_FIRST_PIECE; /* used to store information about which piece returned by OCIStmtGetPieceInfo.
+                            Returns one of the following defined values OCI_ONE_PIECE, OCI_FIRST_PIECE,
+                            OCI_NEXT_PIECE and OCI_LAST_PIECE. */
+    int         out_fd;        /* File descriptor for the output file. */
+    ub4         hdltype; /* type of handle.
+                          OCI_HTYPE_BIND (for a bind handle) or OCI_HTYPE_DEFINE (for a define handle). */
+    ub1         in_out; /* Returns OCI_PARAM_IN if the data is required for an IN bind value.
+                           Returns OCI_PARAM_OUT if the data is available as an OUT bind variable or a define position value. */
+    ub4         iter; /* Returns the row number of a multiple row operation. */
+    ub4         idx; /* The index of an array element of a PL/SQL array bind operation. */
+/*     sb2         indp1;  Indicator. A pointer to a sb2 value or pointer to an indicator structure
+                           for named data types (SQLT_NTY) and REFs (SQLT_REF), that is, *indp is either
+                           an sb2 or a dvoid * depending upon the data type. */
+    OCIParam    *parmdp = NULL; /* A descriptor of the parameter at the position given in the position parameter,
+                            of handle type OCI_DTYPE_PARAM. */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL END DECLARE SECTION;
+
+  /*  init */
+  num_written = 0;
+#ifdef DEBUG
+  /*fprintf(stdout, "%s: Allocating memory for index_rec_ptr...\n", now(NOW_EXT_FMT));*/
+#endif
+  /* Allocate memory for index_rec_ptr. */
+  if ((index_rec_ptr = (t_index_rec *) malloc(sizeof(t_index_rec))) == 0)
+  {
+    fprintf(stderr, "Memory allocation error.\n");
+    error_handler(-1);
+  }
+#ifdef DEBUG
+  /*fprintf(stdout, "%s: Allocated.\n", now(NOW_EXT_FMT));*/
+#endif
+  /* copy date format */
+  if ( strlen(DATE_FMT) > DATE_FMT_LEN )
+  {
+    fprintf(stderr, "Date format too long.\n");
+    error_handler(-30);
+  }
+  else
+    strcpy(datefmt,DATE_FMT);
+  /* copy date and time format */
+  if ( strlen(DATE_TIME_FMT) > DATE_TIME_FMT_LEN )
+  {
+    fprintf(stderr, "Date and time format too long.\n");
+    error_handler(-30);
+  }
+  else
+    strcpy(datetimefmt,DATE_TIME_FMT);
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("selecting documents to be processed");
+
+  /* A statement handle is the context that identifies a SQL or PL/SQL statement and its associated attributes,
+  which are a define handle and a bind handle. */
+  /* allocate a statement handle */
+  retcode = OCIHandleAlloc(
+                           (CONST dvoid *)oeh,
+                           (dvoid **)&stmth,
+                           (ub4)OCI_HTYPE_STMT,
+                           (size_t)0,
+                           (dvoid **)0
+                          );
+  /* Prepare a statement extracting  a bill image */
+  retcode = OCIStmtPrepare(
+                           (OCIStmt *)stmth,
+                           (OCIError *)err,
+                           (CONST text*)stmt,
+                           (ub4)strlen((char *)stmt),
+                           (ub4)OCI_NTV_SYNTAX,
+                           (ub4)OCI_DEFAULT
+                          );
+  /* Bind the address of each input variable or array to each placeholder in the statement.*/
+  /* Customer ID: */
+  checkerr(err, OCIBindByName(
+                              (OCIStmt *)stmth,
+                              (OCIBind **)&bind_cust_id_h,
+                              (OCIError *)err,
+                              (CONST text *)":customer_id",
+                              (sb4)strlen((char *)":customer_id"),
+                              (dvoid *)&index_rec_ptr->customer_id,
+                              (sb4)sizeof(index_rec_ptr->customer_id),
+                              (ub2)SQLT_INT,
+                              (dvoid *)0,
+                              (ub2 *)0,
+                              (ub2 *)0,
+                              (ub4)0,
+                              (ub4 *)0,
+                              (ub4)OCI_DEFAULT
+                             ));
+  /* BI date: */
+  checkerr(err, OCIBindByName(
+                              (OCIStmt *)stmth,
+                              (OCIBind **)&bind_bi_date_h,
+                              (OCIError *)err,
+                              (CONST text *)":bi_date",
+                              (sb4)strlen((char *)":bi_date"),
+                              (dvoid *)index_rec_ptr->bi_date,
+                              (sb4)sizeof(index_rec_ptr->bi_date),
+                              (ub2)SQLT_STR,
+                              (dvoid *)0,
+                              (ub2 *)0,
+                              (ub2 *)0,
+                              (ub4)0,
+                              (ub4 *)0,
+                              (ub4)OCI_DEFAULT
+                             ));
+  /* date format: */
+  checkerr(err, OCIBindByName(
+                              (OCIStmt *)stmth,
+                              (OCIBind **)&bind_datefmt_h,
+                              (OCIError *)err,
+                              (CONST text *)":datefmt",
+                              (sb4)strlen((char *)":datefmt"),
+                              (dvoid *)datefmt,
+                              (sb4)sizeof(datefmt),
+                              (ub2)SQLT_STR,
+                              (dvoid *)0,
+                              (ub2 *)0,
+                              (ub2 *)0,
+                              (ub4)0,
+                              (ub4 *)0,
+                              (ub4)OCI_DEFAULT
+                             ));
+  /* Row ID: */
+  checkerr(err, OCIBindByName(
+                              (OCIStmt *)stmth,
+                              (OCIBind **)&bind_row_id_h,
+                              (OCIError *)err,
+                              (CONST text *)":row_id",
+                              (sb4)strlen((char *)":row_id"),
+                              (dvoid *)index_rec_ptr->row_id,
+                              (sb4)sizeof(index_rec_ptr->row_id),
+                              (ub2)SQLT_STR,
+                              (dvoid *)0,
+                              (ub2 *)0,
+                              (ub2 *)0,
+                              (ub4)0,
+                              (ub4 *)0,
+                              (ub4)OCI_DEFAULT
+                             ));
+  /* define a cursor */
+#ifdef DEBUG
+  /*fprintf(stdout, "%s: Define a cursor.\n", now(NOW_EXT_FMT));*/
+#endif
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL DECLARE bconv_index_cursor CURSOR FOR
+    SELECT FNAME, ROW_ID, BI_SIZE, CUSTOMER_ID, TO_CHAR(bi_date,:datefmt), STATUS,
+      TO_CHAR(LAST_D_T,:datetimefmt), PROC_ID
+      FROM BCONV_INDEX WHERE STATUS = 10 AND PROC_ID = :reg_params.proc_id
+      FOR UPDATE;
+  /* Open the cursor. */
+#ifdef DEBUG
+  /*fprintf(stdout, "%s: Open the cursor.\n", now(NOW_EXT_FMT));*/
+#endif
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL OPEN bconv_index_cursor;
+
+  /* break if no rows was fetched */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER NOT FOUND DO break;
+  /* fetch and process data in a loop */
+#ifdef DEBUG
+  /*fprintf(stdout, "%s: Entering a loop.\n", now(NOW_EXT_FMT));*/
+#endif
+  for(;;)
+  {
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: Fetching bconv_index_cursor.\n", now(NOW_EXT_FMT));*/
+#endif
+    /* init */
+    bi_rec = NULL; /* It is required for the first call of realloc in the next iteration to have it set to NULL */
+    bilencount = 0;
+    /* get parameters of a document to be processed */
+    EXEC SQL CONTEXT USE :ctx1;
+    EXEC SQL FETCH bconv_index_cursor INTO :index_rec_ptr;
+    /* extract the document */
+    /* Execute the statement.
+    If program variables do not contain data at bind time, make sure they contain valid data when you execute the SQL statement */
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: Calling OCIStmtExecute.\n", now(NOW_EXT_FMT));*/
+#endif
+    retcode = OCIStmtExecute(
+                             (OCISvcCtx *)svc,
+                             (OCIStmt *)stmth,
+                             (OCIError *)err,
+                             (ub4)0,
+                             (ub4)0,
+                             (CONST OCISnapshot *)0,
+                             (OCISnapshot *)0,
+                             (ub4)OCI_DEFAULT
+                            );
+    /* The next two statements describe the select-list item, bi_extension, and return its length */
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: Calling OCIParamGet.\n", now(NOW_EXT_FMT));*/
+#endif
+    checkerr(err, OCIParamGet(
+                              (CONST dvoid *)stmth,
+                              (ub4)OCI_HTYPE_STMT,
+                              (OCIError *)err,
+                              (dvoid **)&parmdp,
+                              (ub4)2
+                             ));
+    /* This call returns a descriptor of a parameter specified by position in the describe handle or statement handle.
+    Parameter descriptors are always allocated internally by the OCI library. They can be freed using OCIDescriptorFree().
+    For example, if you fetch the same column metadata for every execution of a statement,
+    then the program will leak memory unless you explicitly free the parameter descriptor between each call to OCIParamGet(). */
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: Calling OCIAttrGet.\n", now(NOW_EXT_FMT));*/
+#endif
+    biextlen = 0;
+    checkerr(err, OCIAttrGet(
+                             (CONST dvoid *)parmdp,
+                             (ub4)OCI_DTYPE_PARAM,
+                             (dvoid *)&biextlen,
+                             (ub4 *)0,
+                             (ub4)OCI_ATTR_DATA_SIZE,
+                             (OCIError *)err
+                            ));
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: The retrieved length of bi_extension: %d.\n", now(NOW_EXT_FMT),biextlen);*/
+#endif
+    /* Use the retrieved length of bi_extension to allocate an output buffer, and then define the output variable. */
+    if ( (bi_extension = (char *)malloc((size_t)biextlen + 1)) == NULL)
+    {
+      fprintf(stderr, "Memory allocation error.\n");
+      error_handler(-13);
+    }
+    /* init */
+    strcpy(bi_extension,"");
+    /* Define an output variable using OCIDefineByPos(), with mode set to OCI_DYNAMIC_FETCH.
+    At this point you do not need to specify the actual size of the pieces you will use,
+    but you must provide the total size of the data that will be fetched at run time. */
+    /* When you set the mode parameter of an OCIDefineByPos() call to OCI_DYNAMIC_FETCH,
+    this indicates that an application will dynamically provide allocation space for receiving data at the time of the fetch. */
+    /* Output buffers must be 2-byte aligned. ??? */
+    /* Define an output variable for each select-list item in the SQL statement. */
+    /* bi_image: */
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: Calling OCIDefineByPos.\n", now(NOW_EXT_FMT));*/
+    /*fprintf(stdout, "bilen before OCIDefineByPos: %d.\n", bilen);*/
+#endif
+    retcode = OCIDefineByPos(
+                             (OCIStmt *)stmth,
+                             (OCIDefine **)&defn_bi_h,
+                             (OCIError *)err,
+                             (ub4)1,
+                             (dvoid *)NULL, /* No buffer passed here - since it is piecewise */
+                             (sb4)SB4MAXVAL, /* old: index_rec_ptr->bi_size *//* Set the maximum you could possibly want */
+                             (ub2)SQLT_LBI,
+                             (dvoid *)0,
+                             (ub2 *)&bilen, /* old: 0 *//* This will be set to the total size once complete */
+                             (ub2 *)0,
+                             (ub4)OCI_DYNAMIC_FETCH /* To indicate that this is a piecewise `operation */
+                            );
+    /* bi_extension: */
+#ifdef DEBUG
+    /*fprintf(stdout, "bilen after OCIDefineByPos: %d.\n", bilen);*/
+    /*fprintf(stdout, "%s: Calling OCIDefineByPos.\n", now(NOW_EXT_FMT));*/
+#endif
+    retcode = OCIDefineByPos(
+                             (OCIStmt *)stmth,
+                             (OCIDefine **)&defn_bi_ext_h,
+                             (OCIError *)err,
+                             (ub4)2,
+                             (dvoid *)bi_extension,
+                             (sb4)biextlen + 1,
+                             (ub2)SQLT_STR,
+                             (dvoid *)0,
+                             (ub2 *)0,
+                             (ub2 *)0,
+                             (ub4)OCI_DEFAULT
+                            );
+
+    /* Call OCIStmtFetch() for the first time. At this point no data is actually retrieved,
+    and the OCI_NEED_DATA error code is returned to the application.
+    If any other value is returned, an error occurred. */
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: Calling OCIStmtFetch2.\n", now(NOW_EXT_FMT));*/
+#endif
+    retcode = OCIStmtFetch2 (
+                             (OCIStmt *)stmth,
+                             (OCIError *)err,
+                             (ub4)1,
+                             (ub2)OCI_FETCH_NEXT,
+                             (sb4)0,
+                             (ub4)OCI_DEFAULT
+                            );
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: Return code of OCIStmtFetch2: %d.\n", now(NOW_EXT_FMT), retcode);*/
+    /*fprintf(stdout, "%s: bi_extension: %s.\n", now(NOW_EXT_FMT), bi_extension);*/
+#endif
+    while (retcode != OCI_NO_DATA && retcode != OCI_SUCCESS)
+    {
+      switch(retcode)
+      {
+        case OCI_NEED_DATA:
+          /* Keep in mind that the fetch buffer can be of arbitrary size.
+          In addition, each fetched piece does not need to be of the same size.
+          The only requirement is that the size of the final fetch must be exactly the size of the last remaining piece.
+          The size of each piece to be fetched is established by each OCIStmtSetPieceInfo() call. */
+          /* Call OCIStmtGetPieceInfo() to obtain information about the piece to be fetched.
+          The piecep parameter indicates whether it is the first piece (OCI_FIRST_PIECE),
+          a subsequent piece (OCI_NEXT_PIECE), or the last piece (OCI_LAST_PIECE).  */
+          /* defn_bi_h is set by this call if a null is passed,
+          iter (piece type) is also set */
+
+#ifdef DEBUG
+          /*fprintf(stdout, "Get piece info.\n");*/
+#endif
+          retcode = OCIStmtGetPieceInfo(
+                                        (OCIStmt *)stmth,
+                                        (OCIError *)err,
+                                        (dvoid **)&defn_bi_h,
+                                        (ub4 *)&hdltype,
+                                        (ub1 *)&in_out,
+                                        (ub4 *)&iter,
+                                        (ub4 *)&idx,
+                                        (ub1 *)&piece
+                                       );
+          /* Call OCIStmtSetPieceInfo() to specify the buffer into which you wish to fetch the piece.  */
+          /*  The most important thing to note is that the variable passed with the
+           *  piece size is modified after the call to OCIStmtFetch to reflect the
+           *  actual number of bytes retrieved once the end of the field is reached
+           *  - the value passed as buffer_size in the original OCIDefineByPos is
+           *  also populated AT THE END OF THE OPERATON ONLY with the total length
+           *  of the field.
+           */
+#ifdef DEBUG
+          /*fprintf(stdout, "Set piece info.\n");*/
+#endif
+          /* set a buffer length */
+          buflen = (ub4)cmd_params.chunk_size;
+          /* allocate memory for the buffer to hold the piece */
+          if ( (bi_buf = (ub1 *)malloc((size_t)buflen)) == NULL )
+          {
+            fprintf(stderr, "Memory allocation error.\n");
+            error_handler(-13);
+          }
+#ifdef DEBUG
+          /*fprintf(stdout, "buflen before OCIStmtSetPieceInfo: %d.\n", buflen);*/
+          /*fprintf(stdout, "bilen before OCIStmtSetPieceInfo: %d.\n", bilen);*/
+#endif
+          retcode = OCIStmtSetPieceInfo(
+                                        (dvoid *)defn_bi_h,
+                                        (ub4)OCI_HTYPE_DEFINE, /* old: hdltype *//* IMPORTANT use OCI_HTYPE_DEFINE for Fetch */
+                                        (OCIError *)err,
+                                        (CONST dvoid *)bi_buf,
+                                        (ub4 *)&buflen, /* Use to return the actual length of the piece at end */
+                                        (ub1)piece,
+                                        (CONST dvoid *)NULL, /* old: &indp1 */
+                                        (ub2 *)NULL /* old: retcode */
+                                       );
+#ifdef DEBUG
+          /*fprintf(stdout, "buflen after OCIStmtSetPieceInfo: %d.\n", buflen);*/
+          /*fprintf(stdout, "bilen after OCIStmtSetPieceInfo: %d.\n", bilen);*/
+#endif
+          /* Call OCIStmtFetch() again to retrieve the actual piece.
+          If OCIStmtFetch() returns OCI_SUCCESS, all the pieces have been fetched successfully.
+          If OCIStmtFetch() returns OCI_NEED_DATA, return to Step 4 to process the next piece.
+          If any other value is returned, an error occurred. */
+          break;
+        default:
+          fprintf(stderr, "Error fetching a bill image.\n");
+#ifdef DEBUG
+          /*fprintf(stdout, "retcode: %d.\n", retcode);*/
+#endif
+          error_handler(-1);
+      } /* end switch */
+#ifdef DEBUG
+      /*fprintf(stdout, "Fetch a piece.\n");*/
+#endif
+      retcode = OCIStmtFetch2 (
+                               (OCIStmt *)stmth,
+                               (OCIError *)err,
+                               (ub4)1,
+                               (ub2)OCI_FETCH_NEXT,
+                               (sb4)0,
+                               (ub4)OCI_DEFAULT
+                              );
+/*      checkerr(err,OCIStmtFetch2 (stmth, err, (ub4)1, (ub2)OCI_DEFAULT, (sb4)0, (ub4)OCI_DEFAULT));*/
+      /* update information about amount of bytes of bi_image already fetched */
+      bilencount += buflen;
+      /* allocate memory for a buffer to hold the whole bi_image */
+      if ( (bi_rec = (ub1 *)realloc((void *)bi_rec, (size_t)bilencount)) == NULL )
+      {
+        fprintf(stderr, "Memory allocation error.\n");
+        error_handler(-13);
+      }
+      /* copy the piece to the buffer holding the whole bi_image */
+      bcopy(bi_buf, bi_rec+bilencount-buflen, (size_t)buflen);
+#ifdef DEBUG
+      /*fprintf(stdout, "buflen after OCIStmtFetch2: %d.\n", buflen);*/
+      /*fprintf(stdout, "bilen after OCIStmtFetch2: %d.\n", bilen);*/
+      /*fprintf(stdout, "index_rec_ptr->bi_size: %d.\n", index_rec_ptr->bi_size);*/
+      /*fprintf(stdout, "Data : %s\n", bi_buf);*/
+      /*fprintf(stdout, "Fetched the piece.\n");*/
+      /*fprintf(stdout, "bi_extension: %s.\n", bi_extension);*/
+      /*fprintf(stdout, "which piece: %d.\n", piece);*/
+#endif
+      /* free memory */
+      free(bi_buf);
+      bi_buf = NULL;
+    } /* end while */
+    /* Set a file name if needed */
+    /* init */
+    strcpy(filename,"");
+    if ( (strlen(cmd_params.work_dir)+strlen(DIR_SEPARATOR)) > filename_len )
+    {
+      fprintf(stderr, "File name too long.\n");
+      error_handler(-30);
+    }
+    else
+    {
+      strcpy(filename,cmd_params.work_dir);
+      strcat(filename,DIR_SEPARATOR);
+    }
+    if ( bi_extension == NULL )
+    {
+      fprintf(stderr, "\n\nMissing document extension.\n");
+      /* if the document extension is missing, update status in BCONV_INDEX and continue */
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL whenever sqlerror do sql_error("updating BCONV_INDEX");
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL update bconv_index set status = -10, last_d_t=SYSDATE where CURRENT OF bconv_index_cursor;
+      /* commit the transaction */
+      /* sql_commit(); */ /* we'll commit it after finishing the loop */
+      /* free memory */
+      free(bi_rec);
+      bi_rec = NULL;
+      free(bi_extension);
+      bi_extension = NULL;
+      retcode = OCIDescriptorFree(
+                                  (dvoid *)parmdp,
+                                  (ub4)OCI_DTYPE_PARAM
+                                 );
+      /* continue with the next document */
+      continue;
+    }
+    else if ( strcmp(bi_extension,"xml") == 0 )
+    {
+      if ( (strlen(filename)+strlen(XML_DIR_NAME)) > filename_len )
+      {
+        fprintf(stderr, "File name too long.\n");
+        error_handler(-30);
+      }
+      else
+        strcat(filename,XML_DIR_NAME);
+    }
+    else if ( strcmp(bi_extension,"ps") == 0 )
+    {
+      if ( (strlen(filename)+strlen(PS_DIR_NAME)) > filename_len )
+      {
+        fprintf(stderr, "File name too long.\n");
+        error_handler(-30);
+      }
+      else
+        strcat(filename,PS_DIR_NAME);
+    }
+    else
+    {
+      fprintf(stderr, "\n\nUnknown document extension: '%s'\n", bi_extension);
+      /* if the it is unknown document extension, update status in BCONV_INDEX and continue */
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL whenever sqlerror do sql_error("updating BCONV_INDEX");
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL update bconv_index set status = -10, last_d_t=SYSDATE where CURRENT OF bconv_index_cursor;
+      /* commit the transaction */
+      /* sql_commit(); */ /* we'll commit it after finishing the loop */
+      /* free memory */
+      free(bi_rec);
+      bi_rec = NULL;
+      free(bi_extension);
+      bi_extension = NULL;
+      retcode = OCIDescriptorFree(
+                                  (dvoid *)parmdp,
+                                  (ub4)OCI_DTYPE_PARAM
+                                 );
+      /* continue with the next document */
+      continue;
+    }
+    if ( (strlen(filename)+strlen(DIR_SEPARATOR)+strlen(index_rec_ptr->fname)
+          +strlen(EXT_SEPARATOR)+strlen(bi_extension)) > filename_len )
+    {
+      fprintf(stderr, "File name too long.\n");
+      error_handler(-30);
+    }
+    else
+    {
+      strcat(filename,DIR_SEPARATOR);
+      strcat(filename,index_rec_ptr->fname);
+      strcat(filename,EXT_SEPARATOR);
+      strcat(filename,bi_extension);
+    }
+    /* It is better to use bi_size since this is the true initial size of the document.
+    Some document are stores as null terminated strings. Extracting such a document with
+    the null makes stored file unreadable.*/
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: Writing to a file.\n", now(NOW_EXT_FMT));*/
+#endif
+    /* Write the contents of buf to the file. */
+    num_written = write_file(filename, bi_rec, (size_t)index_rec_ptr->bi_size);
+    if ((num_written == 0) || (num_written != (ssize_t)index_rec_ptr->bi_size))
+    {
+      fprintf(stderr, "\n\nError while writing file '%s':\n", filename);
+      /* if the document extracted unsuccessfully, update status in BCONV_INDEX */
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL whenever sqlerror do sql_error("updating BCONV_INDEX");
+      EXEC SQL update bconv_index set status = -10, last_d_t=SYSDATE where CURRENT OF bconv_index_cursor;
+      /* commit the transaction */
+      sql_commit();
+      /* close the database and raise the error */
+      do_disconnect();
+      error_handler(-1);
+    }
+    /* The piecewise fetch is complete when the final OCIStmtFetch() call returns a value of OCI_SUCCESS. */
+    /* if the document extracted successfully, update status in BCONV_INDEX */
+#ifdef DEBUG
+    /*fprintf(stdout, "%s: Updating BCONV_INDEX.\n", now(NOW_EXT_FMT));*/
+#endif
+    EXEC SQL CONTEXT USE :ctx1;
+    EXEC SQL whenever sqlerror do sql_error("updating BCONV_INDEX");
+    if ( bi_extension == NULL )
+    {
+      fprintf(stderr, "\n\nNull document extension.\n");
+      /* it should have been processed above. it is something strange if the execution
+      got here. so terminate the program. */
+      error_handler(-1);
+    }
+    else     if ( strcmp(bi_extension,"xml") == 0 )
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL update bconv_index set status = 11, last_d_t=SYSDATE where CURRENT OF bconv_index_cursor;
+    }
+    else if ( strcmp(bi_extension,"ps") == 0 )
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL update bconv_index set status = 12, last_d_t=SYSDATE where CURRENT OF bconv_index_cursor;
+    }
+    else
+    {
+      fprintf(stderr, "\n\nIllegal document extension: '%s'\n", bi_extension);
+      /* it should have been processed above. it is something strange if the execution
+      got here. so terminate the program. */
+      error_handler(-1);
+    }
+    /* free memory */
+    free(bi_extension);
+    bi_extension = NULL;
+    free(bi_rec);
+    bi_rec = NULL;
+    retcode = OCIDescriptorFree(
+                                (dvoid *)parmdp,
+                                (ub4)OCI_DTYPE_PARAM
+                               );
+  } /* for (;;) */
+
+#ifdef DEBUG
+  /*fprintf(stdout, "%s: The loop ended.\n", now(NOW_EXT_FMT));*/
+#endif
+  /* disable the cursor */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL CLOSE bconv_index_cursor;
+
+  /* free memory */
+  free(index_rec_ptr);
+  index_rec_ptr = NULL;
+  /* deallocate OCI handles */
+  retcode = OCIHandleFree(
+                         (dvoid *)stmth,
+                         (ub4)OCI_HTYPE_STMT
+                        );
+  /* commit the transaction */
+  sql_commit();
+}
+
+
+/****************************************************/
+/* reserve a group of documents for processing.
+returns a number of rows reserved. */
+/****************************************************/
+int do_reserve(t_cmd_params cmd_params, t_reg_params reg_params)
+{
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL BEGIN DECLARE SECTION;
+    int   i = -1; /* number of rows processed */
+    int   j;
+    char  datefmt[DATE_FMT_LEN+1];
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL END DECLARE SECTION;
+
+  /* copy date format */
+  if ( strlen(DATE_FMT) > DATE_FMT_LEN )
+  {
+    fprintf(stderr, "File name too long.\n");
+    error_handler(-30);
+  }
+  else
+    strcpy(datefmt,DATE_FMT);
+  /* locking a group of rows to be updated */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("selecting BCONV_INDEX for update (declaring a cursor)");
+  /* define a cursors */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL DECLARE lock_cursor CURSOR FOR
+    SELECT 1 FROM BCONV_INDEX WHERE STATUS = 0 AND ROWNUM<=:cmd_params.batch_size FOR UPDATE;
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL DECLARE lock_cursor_d CURSOR FOR
+    SELECT 1 FROM BCONV_INDEX WHERE STATUS = 0 AND ROWNUM<=:cmd_params.batch_size
+    AND BI_DATE=TO_DATE(:cmd_params.bi_date,:datefmt) FOR UPDATE;
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL DECLARE lock_cursor_c CURSOR FOR
+    SELECT 1 FROM BCONV_INDEX WHERE STATUS = 0 AND ROWNUM<=:cmd_params.batch_size
+    AND CUSTOMER_ID BETWEEN :cmd_params.from_cust_id AND :cmd_params.to_cust_id FOR UPDATE;
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL DECLARE lock_cursor_cd CURSOR FOR
+    SELECT 1 FROM BCONV_INDEX WHERE STATUS = 0 AND ROWNUM<=:cmd_params.batch_size
+    AND CUSTOMER_ID BETWEEN :cmd_params.from_cust_id AND :cmd_params.to_cust_id
+    AND BI_DATE=TO_DATE(:cmd_params.bi_date,:datefmt) FOR UPDATE;
+  /* open a suitable cursor and identify an active set */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("selecting BCONV_INDEX for update (opening a cursor)");
+  if ( (cmd_params.from_cust_id == 0) && (cmd_params.to_cust_id == 0) )
+  {
+    if ( (int)strlen(cmd_params.bi_date) == 0 )
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL OPEN lock_cursor;
+    }
+    else
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL OPEN lock_cursor_d;
+    }
+  }
+  else
+  {
+    if ( (int)strlen(cmd_params.bi_date) == 0 )
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL OPEN lock_cursor_c;
+    }
+    else
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL OPEN lock_cursor_cd;
+    }
+  }
+  /* break if the last row was already fetched */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER NOT FOUND DO break;
+  /* fetch and process data in a loop */
+  for (;;)
+  {
+    /* use the right cursor */
+    if ( (cmd_params.from_cust_id == 0) && (cmd_params.to_cust_id == 0) )
+    {
+      if ( (int)strlen(cmd_params.bi_date) == 0 )
+      {
+        EXEC SQL CONTEXT USE :ctx1;
+        EXEC SQL FETCH lock_cursor INTO :j;
+      }
+      else
+      {
+        EXEC SQL CONTEXT USE :ctx1;
+        EXEC SQL FETCH lock_cursor_d INTO :j;
+      }
+    }
+    else
+    {
+      if ( (int)strlen(cmd_params.bi_date) == 0 )
+      {
+        EXEC SQL CONTEXT USE :ctx1;
+        EXEC SQL FETCH lock_cursor_c INTO :j;
+      }
+      else
+      {
+        EXEC SQL CONTEXT USE :ctx1;
+        EXEC SQL FETCH lock_cursor_cd INTO :j;
+      }
+    }
+    /* Reserve the document for processing */
+    EXEC SQL CONTEXT USE :ctx1;
+    EXEC SQL WHENEVER SQLERROR DO sql_error("updating BCONV_INDEX");
+    /*
+    fprintf(stdout, "reg_params.proc_id: %d\n",reg_params.proc_id);
+    */
+    if ( (cmd_params.from_cust_id == 0) && (cmd_params.to_cust_id == 0) )
+    {
+      if ( (int)strlen(cmd_params.bi_date) == 0 )
+      {
+        EXEC SQL CONTEXT USE :ctx1;
+        EXEC SQL update bconv_index set status = 10, proc_id = :reg_params.proc_id, last_d_t=SYSDATE
+          WHERE CURRENT OF lock_cursor;
+      }
+      else
+      {
+        EXEC SQL CONTEXT USE :ctx1;
+        EXEC SQL update bconv_index set status = 10, proc_id = :reg_params.proc_id, last_d_t=SYSDATE
+          WHERE CURRENT OF lock_cursor_d;
+      }
+    }
+    else
+    {
+      if ( (int)strlen(cmd_params.bi_date) == 0 )
+      {
+        EXEC SQL CONTEXT USE :ctx1;
+        EXEC SQL update bconv_index set status = 10, proc_id = :reg_params.proc_id, last_d_t=SYSDATE
+          WHERE CURRENT OF lock_cursor_c;
+      }
+      else
+      {
+        EXEC SQL CONTEXT USE :ctx1;
+        EXEC SQL update bconv_index set status = 10, proc_id = :reg_params.proc_id, last_d_t=SYSDATE
+          WHERE CURRENT OF lock_cursor_cd;
+      }
+    }
+  }
+  /* get number of rows updated */
+  i = sqlca.sqlerrd[2];
+  /* disable the cursor */
+  if ( (cmd_params.from_cust_id == 0) && (cmd_params.to_cust_id == 0) )
+  {
+    if ( (int)strlen(cmd_params.bi_date) == 0 )
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL CLOSE lock_cursor;
+    }
+    else
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL CLOSE lock_cursor_d;
+    }
+  }
+  else
+  {
+    if ( (int)strlen(cmd_params.bi_date) == 0 )
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL CLOSE lock_cursor_c;
+    }
+    else
+    {
+      EXEC SQL CONTEXT USE :ctx1;
+      EXEC SQL CLOSE lock_cursor_cd;
+    }
+  }
+  /* commit changes to release resources */
+  sql_commit();
+  return i;
+}
+
+
+/*
+ *  Function: checkerr
+ *
+ *  Description:  This routine checks for an error status and then
+ *      reports any errors encountered.
+ *      It does not exit the program unless an OCI_ERROR is encountered.
+ */
+void checkerr(OCIError *errhp, sword status)
+{
+  text errbuf[512];
+  ub4 errcode;
+
+  /* init */
+  strcpy(errbuf,"");
+  switch (status)
+  {
+  case OCI_SUCCESS:
+    break;
+  case OCI_SUCCESS_WITH_INFO:
+    (void) fprintf(stderr, "Error - OCI_SUCCESS_WITH_INFO\n");
+    break;
+  case OCI_NEED_DATA:
+    (void) fprintf(stderr, "Error - OCI_NEED_DATA\n");
+    break;
+  case OCI_NO_DATA:
+    (void) fprintf(stderr, "Error - OCI_NODATA\n");
+    break;
+  case OCI_ERROR:
+    (void) OCIErrorGet(
+                       (dvoid *)errhp,
+                       (ub4)1,
+                       (text *)NULL,
+                       (sb4 *)&errcode,
+                       (text *)errbuf,
+                       (ub4)sizeof(errbuf),
+                       (ub4)OCI_HTYPE_ERROR
+                      );
+    (void) fprintf(stderr, "Error - %s\n", errbuf);
+    break;
+  case OCI_INVALID_HANDLE:
+    (void) fprintf(stderr, "Error - OCI_INVALID_HANDLE\n");
+    break;
+  case OCI_STILL_EXECUTING:
+    (void) fprintf(stderr, "Error - OCI_STILL_EXECUTING\n");
+    break;
+  case OCI_CONTINUE:
+    (void) fprintf(stderr, "Error - OCI_CONTINUE\n");
+    break;
+default:
+    break;
+  }
+}
+
+
+/****************************************************/
+/****************************************************/
+/****************************************************/

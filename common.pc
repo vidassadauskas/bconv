@@ -1,0 +1,814 @@
+/****************************************************/
+#ifdef LINUXOS
+#define _GNU_SOURCE
+#include <termios.h>
+#include <signal.h>
+#else
+#include <signal.h>
+#endif /* LINUXOS */
+
+#include <sys/types.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <regex.h>
+#include <time.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ulimit.h>
+#include <sys/utsname.h>
+
+/****************************************************/
+EXEC SQL INCLUDE SQLCA;
+EXEC SQL INCLUDE ORACA;
+/*EXEC SQL INCLUDE ORATYPES;*/
+EXEC SQL INCLUDE SQLCPR;
+
+#include <sql2oci.h>
+#include <oci.h>
+
+#include "common.h"
+
+
+/**********************************************
+Purpose:
+Various Oracle definitions.
+**********************************************/
+/* Specifying the RELEASE_CURSOR=YES option instructs Pro*C
+ * to release resources associated with embedded SQL
+ * statements after they are executed.  This ensures that
+ * ORACLE does not keep parse locks on tables after data
+ * manipulation operations, so that subsequent data definition
+ * operations on those tables do not result in a parse-lock
+ * error.
+ */
+EXEC ORACLE OPTION (RELEASE_CURSOR=YES);
+
+/* The ORACA=YES option must be specified to enable you
+ * to use the ORACA.
+ */
+EXEC ORACLE OPTION (ORACA=YES);
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Returns a portion of the given string, beginning
+at character m, n characters long. If m is
+positive, the function counts from the beginning
+of the string to find the first character.  If m
+is negative, the function counts backwards from
+the end of the string. The values m and n cannot
+be 0. The value n cannot be less than 1. In case
+of error the function returns null pointer. If
+m falls beyond the string, empty string is
+returned.
+**********************************************/
+/****************************************************/
+char *substr(char *sstr, char *str, int m, int n)
+{
+  char *l_str = NULL;
+  int  len;
+  int  i;
+
+  /* check if parameters are correct */
+  if ( (m == 0) || (n <= 0) || ( (len = (int)strlen(str)) == 0 ) )
+  { return NULL; }
+  /* initialize l_str */
+  /* allocate memory for l_str */
+  else if ( (l_str = (char *)malloc(sizeof(char)*(len+1))) == NULL)
+  {
+    fprintf(stderr, "Memory allocation error.\n");
+    return NULL;
+  }
+  else if ( abs(m) > len ) /* m falls beyond the string */
+  {
+    sstr[0] = '\0';
+    strcpy(l_str, sstr);
+    return l_str;
+  }
+  else if ( m > 0 )
+  {
+    sstr[0] = str[m-1];
+    for (i=m;((str[i] != '\0')&&(i-m < n-1 ));i++)
+      sstr[i-m+1] = str[i];
+    sstr[i-m+1] = '\0';
+  }
+  else  /* ( m < 0 ) */
+  {
+    sstr[0] = str[len+m];
+    for (i=1;(( (len+m) > 0 ) && ( n > 0 ) ); n--, m--, i++)
+      sstr[i] = str[len+m+1];
+    sstr[i] = '\0';
+  }
+  strcpy(l_str, sstr);
+  return l_str;
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Actions to be performed when TERM signal is
+received.
+**********************************************/
+/****************************************************/
+void signal_handler(int signo)
+{
+  if ( signo == SIGTERM )
+  {
+    /* set a global variable to indicate that */
+    sig_term = 1;
+  }
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Check if the program should be teminated.
+**********************************************/
+/****************************************************/
+void termination(t_reg_params reg_params)
+{
+  /* if TERM signal is received then exit */
+  if ( sig_term == 1 )
+  {
+    sig_term = 0;
+    fprintf(stdout, "Got TERM signal. Exiting.\n");
+    /* Unregister the process. */
+    do_unregister(reg_params);
+    /* disconnect from database */
+    do_disconnect();
+    /* exit the program */
+    error_handler(0);
+  }
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Parse command line parameters.
+**********************************************/
+/****************************************************/
+void parse_params(int argc, char **argv, t_cmd_params *cmd_params)
+{
+  int   from_cust_id;
+  int   to_cust_id;
+  int   c;
+  char  cust_id[OPTARG_LEN+1];
+
+  /* get a process name */
+  if ( strlen(argv[0]) > FILENAME_LEN )
+  {
+    fprintf(stderr, "Program name too long.\n");
+    error_handler(-30);
+  }
+  else if ( strcpy(cmd_params->prog_name,argv[0]) == NULL )
+  {
+    fprintf(stderr, "Error getting a process name.\n");
+    error_handler(1);
+  }
+#ifdef DEBUG
+  fprintf(stdout,"cmd_params->prog_name: %s\n",cmd_params->prog_name);
+#endif
+  /* loop through the list of arguments */
+  /* check correctness of the parameter value
+  and assign it to the corresponding variable in cmd_params structure
+  */
+  /* optarg = NULL; */
+  while ( (c = getopt(argc, argv, ARGS)) != -1)
+  {
+#ifdef DEBUG
+    /*fprintf(stdout,"optarg: %s\n",optarg);*/
+#endif
+    if ( ( optarg == NULL ) && ( ( c == 'b' ) ||
+                                 ( c == 'c' ) ||
+                                 ( c == 's' ) ||
+                                 ( c == 'n' ) ||
+                                 ( c == 'C' ) ||
+                                 ( c == 'd' )
+                               )
+       )
+    {
+      fprintf(stderr, "Parameter of option \"%c\" is null.\n", c);
+      error_handler(-10);
+    }
+    else {
+    switch (c)
+    {
+      case 'v':
+      { /* -v (Just print version and exit) */
+        version(cmd_params->version_info);
+        error_handler(0);
+        break;
+      }
+      case 'h':
+      { /* -h (Just print a help and exit) */
+        help(cmd_params->prog_name);
+        error_handler(0);
+        break;
+      }
+      case 'b':
+      { /* -c batch_size */
+        if ( ( atoi(optarg) <= 0 )||( atoi(optarg) == INT_MIN )||( atoi(optarg) == INT_MAX ) )
+        {
+          /* invalid parameter value, terminate */
+          fprintf(stderr, "Invalid batch size argument \"%s\".\n", optarg);
+          error_handler(-10);
+        }
+        else /* assign it to the corresponding variable in cmd_params structure */
+          cmd_params->batch_size = atoi(optarg);
+        break;
+      }
+      case 'c':
+      { /* -c chunk_size */
+        if ( ( atoi(optarg) <= 0 )||( atoi(optarg) == INT_MIN )||( atoi(optarg) == INT_MAX ) )
+        {
+          /* invalid parameter value, terminate */
+          fprintf(stderr, "Invalid chunk size argument \"%s\".\n", optarg);
+          error_handler(-10);
+        }
+        else /* assign it to the corresponding variable in cmd_params structure */
+          cmd_params->chunk_size = atoi(optarg);
+        break;
+      }
+      case 's':
+      { /* -s sleep_time */
+        if ( ( atoi(optarg) <= 0 )||( atoi(optarg) == INT_MIN )||( atoi(optarg) == INT_MAX ) )
+        {
+          /* invalid parameter value, terminate */
+          fprintf(stderr, "Invalid sleep time argument \"%s\".\n", optarg);
+          error_handler(-10);
+        }
+        else /* assign it to the corresponding variable in cmd_params structure */
+          cmd_params->sleep_time = atoi(optarg);
+        break;
+      }
+      case 'n':
+      { /* -n no_of_processes */
+        if ( ( atoi(optarg) <= 0 )||( atoi(optarg) == INT_MIN )||( atoi(optarg) == INT_MAX ) )
+        {
+          /* invalid parameter value, terminate */
+          fprintf(stderr, "Invalid number of processes argument \"%s\".\n", optarg);
+          error_handler(-10);
+        }
+        else /* assign it to the corresponding variable in cmd_params structure */
+          cmd_params->processes = atoi(optarg);
+        break;
+      }
+      case 'd':
+      { /* -d document_date (format: YYYYMMDD) */
+        if ( sscanf(optarg, "%s", cmd_params->bi_date) != 1)
+        {
+          /* invalid parameter value, terminate */
+          fprintf(stderr, "Invalid document date argument \"%s\".\n", optarg);
+          error_handler(-10);
+        }
+        if ( match("^[0-9][0-9][0-9][0-9][0-1][0-9][0-3][0-9]$", cmd_params->bi_date) != 1 )
+        {
+          /* invalid parameter value, terminate */
+          fprintf(stderr, "Invalid document date argument \"%s\".\n", optarg);
+          error_handler(-10);
+        }
+        break;
+      }
+      case 'C':
+      { /* -C customer_id_range (format: from-to) */
+        if ( strlen(optarg) > OPTARG_LEN )
+        {
+          fprintf(stderr, "optarg too long.\n");
+          error_handler(-30);
+        }
+        else if ( strcpy(cust_id,optarg) == NULL )
+        {
+          fprintf(stderr, "Error copying a customer ID range.\n");
+          error_handler(-1);
+        }
+        else if ( sscanf(cust_id, "%d-%d", &from_cust_id, &to_cust_id) != 2)
+        {
+          /* invalid parameter value, terminate */
+          fprintf(stderr, "Invalid customer ID range argument \"%s\".\n", optarg);
+#ifdef DEBUG
+          /*fprintf(stdout,"from: %d; to: %d\n",from_cust_id,to_cust_id);*/
+          /*fprintf(stdout,"sscanf output: %d\n",sscanf(optarg, "%d-%d", &from_cust_id, &to_cust_id));*/
+#endif
+          error_handler(-10);
+        }
+        /* check correctness of values */
+        else if ( from_cust_id > to_cust_id )
+        {
+          /* invalid parameter value, terminate */
+          fprintf(stderr, "Invalid customer ID range argument \"%s\".\n", optarg);
+          error_handler(-10);
+        }
+        else /* assign it to the corresponding variable in cmd_params structure */
+        {
+          cmd_params->from_cust_id = from_cust_id;
+          cmd_params->to_cust_id = to_cust_id;
+        }
+        break;
+      }
+      case '?':
+      {
+        /* unknown option or missing parameter, display help and terminate */
+        help(cmd_params->prog_name);
+        error_handler(-10);
+        break;
+      }
+      default:
+      {
+        /* some other error, terminate */
+        fprintf(stderr, "getopt returned character code 0%o\n", c);
+        error_handler(-10);
+      }
+    } /* switch */
+    } /* else */
+  } /* while */
+#ifdef DEBUG
+  fprintf(stdout,"Parameters:\n");
+  fprintf(stdout,"cmd_params->batch_size: %d\n",cmd_params->batch_size);
+  fprintf(stdout,"cmd_params->chunk_size: %d\n",cmd_params->chunk_size);
+  fprintf(stdout,"cmd_params->sleep_time: %d\n",cmd_params->sleep_time);
+  fprintf(stdout,"cmd_params->from_cust_id: %d\n",cmd_params->from_cust_id);
+  fprintf(stdout,"cmd_params->to_cust_id: %d\n",cmd_params->to_cust_id);
+  fprintf(stdout,"cmd_params->bi_date: %s\n",cmd_params->bi_date);
+  fprintf(stdout,"cmd_params->processes: %d\n",cmd_params->processes);
+#endif
+}
+
+
+/**********************************************
+Purpose:
+General error handler.
+**********************************************/
+void error_handler(int exit_code)
+{
+/*  char str_now[DATE_FMT_LEN]; */
+  char *tmp_now = NULL;
+
+  /* get a current date and time */
+  if ( (tmp_now = now(NOW_FMT)) == NULL )
+    fprintf(stderr, "Unable to get a current date and time.\n");
+  else
+  {
+    fprintf(stderr, "Exit date and time: %s\n", tmp_now);
+  }
+  fprintf(stderr, "Exit code: (%d)\n", exit_code);
+  /* free memory */
+  free(tmp_now);
+  exit(exit_code);
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Connect to database.
+**********************************************/
+/****************************************************/
+void do_connect(char *usr, char *pwd)
+{
+  /* Save text of current SQL statement in the ORACA if an
+   * error occurs.
+   */
+  oraca.orastxtf = ORASTFERR;
+
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("Connect");
+#ifdef DEBUG
+  /*fprintf(stdout, "pointer: \"%s\"/\"%s\"\n",usr,pwd);*/
+  fprintf(stdout, "Connecting... ");
+#endif
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL CONNECT :usr IDENTIFIED BY :pwd;
+#ifdef DEBUG
+  fprintf(stdout, "Connected.\n");
+#endif
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Get username and password for connecting to the database.
+Return values:
+0 - success
+-1 - error
+**********************************************/
+/****************************************************/
+int get_usr_pwd(char *usr, char *pwd)
+{
+  char *pwd_ptr = NULL;
+  /* The number of characters actually read. */
+  int charsread;
+#ifdef LINUXOS
+  size_t pwd_len;
+#endif /* LINUXOS */
+
+#ifdef LINUXOS
+  /* initialize pwd_len */
+  pwd_len = PWD_LEN+1;
+#endif /* LINUXOS */
+  /* get a username */
+  fprintf(stdout, "User: ");
+  if ( fgets(usr, USER_LEN+1, stdin) == NULL )
+    return -1;
+  /* Find out how many characters were input. */
+  charsread = (int)strlen(usr);
+  /* If the last character input was newline throw it out by replacing it with null */
+  if (usr[charsread-1] == '\n')
+    usr[charsread-1] = '\0';
+  /* If the last character read was not newline, read and throw away the remaining
+     characters on the line. */
+  else
+  {
+    while (getchar() != '\n') {
+    }
+  }
+  /* get a password */
+#ifdef LINUXOS
+  fprintf(stdout, "Password: ");
+  if ( (my_getpass(&pwd_ptr, &pwd_len, stdin)) == -1 )
+    return -1;
+  if ( pwd_ptr == NULL )
+    return -1;
+  else
+    strcpy(pwd,pwd_ptr);
+  /* Find out how many characters were input. */
+  charsread = (int)strlen(pwd);
+  /* If the last character input was newline throw it out by replacing it with null */
+  if (pwd[charsread-1] == '\n')
+    pwd[charsread-1] = '\0';
+  /* If the last character read was not newline, read and throw away the remaining
+     characters on the line. */
+  else
+  {
+    while (getchar() != '\n') {
+    }
+  }
+#else
+  if ( (pwd_ptr = getpass("Password: ")) == NULL )
+    return -1;
+  strcpy(pwd,pwd_ptr);
+#endif /* LINUXOS */
+  return 0;
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Generic SQL error handler.
+The 'routine' parameter should contain the name
+of the routine executing when the error occured.
+This would be specified in the
+'EXEC SQL whenever sqlerror do sql_error()'
+statement.
+**********************************************/
+/****************************************************/
+void sql_error(char *routine)
+{
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL BEGIN DECLARE SECTION;
+    /* The SQLCA can accommodate error messages up to 70 characters long.
+    To get the full text of longer (or nested) error messages,
+    you need the sqlglm() function.
+    */
+    char message_buffer[ORAERR_MAX];
+    size_t buffer_size;
+    size_t message_length;
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL END DECLARE SECTION;
+
+  buffer_size = sizeof (message_buffer);
+  sqlglm(message_buffer, &buffer_size, &message_length);   /* note use of pointers */
+
+  /* Print diagnostic text containing the error message,
+   * current SQL statement, and location of error.
+   */
+  fprintf(stderr, "\nOracle error while executing %s!\n", routine);
+  fprintf(stderr, "\n%.*s\n", (int)sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+  fprintf(stderr, "in \"%.*s ...\"\n", (int)oraca.orastxt.orastxtl, oraca.orastxt.orastxtc);
+  fprintf(stderr, "on line %d of %.*s.\n\n",
+    oraca.oraslnr, (int)oraca.orasfnm.orasfnml,
+    oraca.orasfnm.orasfnmc);
+  fprintf(stderr, "A full text of the Oracle error message:\n");
+  fprintf(stderr, "\n%.*s\n\n", (int)message_length, message_buffer);
+
+  /* Turn off the call to sql_error() to avoid
+   * a possible infinite loop.
+   */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL ROLLBACK WORK RELEASE;
+
+  error_handler(-1000);
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Commit routine.
+**********************************************/
+/****************************************************/
+void sql_commit(void)
+{
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("committing the work");
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL COMMIT WORK;
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Register the process.
+**********************************************/
+/****************************************************/
+void do_register(t_reg_params *reg_params)
+{
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL BEGIN DECLARE SECTION;
+    int srv_cnt = 0;
+    int srv_id;
+    struct utsname *usname = NULL;
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL END DECLARE SECTION;
+
+  /* allocate memory for d_t_str */
+  if ( (usname = (struct utsname *)malloc(sizeof(struct utsname))) == NULL)
+  {
+    fprintf(stderr, "Memory allocation error.\n");
+    error_handler(-13);
+  }
+  /* get a server name the process  is running on */
+  else if ( uname(usname) == -1 )
+  {
+    fprintf(stderr, "Cannot get a system name.\n");
+    error_handler(-11);
+  }
+  /* check if the server is present in BCONV_SRV */
+#ifdef DEBUG
+  fprintf(stdout, "selecting from BCONV_SRV table.\n");
+#endif
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("selecting from BCONV_SRV table");
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL SELECT COUNT(*) INTO :srv_cnt
+    FROM BCONV_SRV WHERE NAME = :usname->nodename;
+  if ( srv_cnt == 0 )
+  {
+    /* if the server is absent in BCONV_SRV table add it there */
+    EXEC SQL CONTEXT USE :ctx1;
+    EXEC SQL WHENEVER SQLERROR DO sql_error("adding a server into BCONV_SRV table");
+    EXEC SQL CONTEXT USE :ctx1;
+    EXEC SQL INSERT INTO BCONV_SRV VALUES (0, :usname->nodename, NULL);
+    /* commit the transaction */
+    sql_commit();
+  }
+  else if ( srv_cnt != 1 )
+  {
+    /* there must be some data inconsistency in BCONV_SRV table */
+    fprintf(stderr, "Data inconsistency in BCONV_SRV table.\n");
+    fprintf(stderr, "A server %s found %d times in BCONV_SRV table.\n", usname->nodename, srv_cnt);
+    error_handler(-1);
+  }
+  /* get process id */
+  reg_params->pid = (int)getpid();
+  /* get SRV_ID */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("getting SRV_ID");
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL SELECT SRV_ID INTO :srv_id FROM BCONV_SRV WHERE NAME = :usname->nodename;
+  /* register the process in BCONV_PROC table */
+#ifdef DEBUG
+  fprintf(stdout, "inserting into BCONV_PROC table.\n");
+#endif
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("inserting into BCONV_PROC table");
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL INSERT INTO BCONV_PROC
+    VALUES (0, :reg_params->proc_name, :srv_id, :reg_params->pid, SYSDATE, SYSDATE, 1)
+    RETURNING SRV_ID, PROC_ID INTO :reg_params->srv_id, :reg_params->proc_id;
+  /* commit the transaction */
+  sql_commit();
+  /* free memory */
+  free(usname);
+  usname = NULL;
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Unregister the process.
+**********************************************/
+/****************************************************/
+void do_unregister(t_reg_params reg_params)
+{
+  /* unregister the process from BCONV_PROC table */
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("updating BCONV_PROC table");
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL UPDATE BCONV_PROC SET MODDATE=SYSDATE, STATUS=2 WHERE PROC_ID = :reg_params.proc_id;
+  /* check how many rows were updated */
+  if ( sqlca.sqlerrd[2] != 1 )
+  {
+  fprintf(stderr, "Unable to unregister the process. %d rows were updated.\n",sqlca.sqlerrd[2]);
+  error_handler(1);
+  }
+  else
+  {
+  /* commit the transaction */
+  sql_commit();
+  }
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Check if there is a match of an regular expression in a string
+Output values:
+-1 - error occured executing the function
+ 0 - no matches found
+ N - N matches found
+**********************************************/
+/****************************************************/
+int match(char *pattern, char *string)
+{
+  char    message[SLENGTH];
+  char    *start_search = NULL;
+  int     error, count;
+  size_t  msize;
+  regex_t preg;
+  regmatch_t pmatch;
+
+  /* compile a regular expression */
+  if ( (error = regcomp(&preg, pattern, REG_EXTENDED)) != 0 )
+  {
+  msize = regerror(error, &preg, message, SLENGTH);
+  fprintf(stderr, "%s", message);
+  if (msize > SLENGTH)
+    fprintf(stderr, "...");
+  fprintf(stderr, "\n");
+    return -1;
+  }
+  /* compare the compiled regular expression to a string. */
+  error = regexec(&preg, string, 1, &pmatch, 0);
+  if (error == REG_NOMATCH)
+  {
+  /* No matches in the string */
+  return 0;
+  }
+  else if (error != 0)
+  {
+  msize = regerror(error, &preg, message, SLENGTH);
+  fprintf(stderr, "%s", message);
+  if (msize > SLENGTH)
+    fprintf(stderr, "...");
+  fprintf(stderr, "\n");
+    return -1;
+  };
+  /* it means a match was found */
+  count = 1;
+  /* find other matches */
+  start_search = string + pmatch.rm_eo;
+  while (error == 0)
+  {
+  error = regexec(&preg, start_search, 1, &pmatch, REG_NOTBOL);
+  start_search = start_search + pmatch.rm_eo;
+  count++;
+  };
+  count--;
+  /* free any memory allocated by the regcomp() function
+  associated with the preg parameter */
+  regfree(&preg);
+  /* return a number of matches found */
+  return count;
+}
+
+/****************************************************/
+/**********************************************
+Purpose:
+Disconnect from database.
+**********************************************/
+/****************************************************/
+void do_disconnect(void)
+{
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL WHENEVER SQLERROR DO sql_error("disconnecting from DB");
+  EXEC SQL CONTEXT USE :ctx1;
+  EXEC SQL COMMIT WORK RELEASE;
+}
+
+
+/**********************************************
+Purpose:
+Get current date and time in a specified format.
+Return values:
+NULL - in case of an error
+**********************************************/
+char *now(char *fmt)
+{
+  char        *d_t_str = NULL;
+  time_t      nowbin;
+  const struct tm *nowstruct = NULL;
+
+  /* allocate memory for d_t_str */
+  if ( (d_t_str = (char *)malloc((DATE_TIME_FMT_LEN+1) * sizeof(char))) == NULL)
+  {
+    return NULL;
+  }
+  /* get time in seconds since the Epoch */
+  /* Upon successful completion, the time() function returns the value of time
+  in seconds since the Epoch. Otherwise, the value (time_t)-1 is returned. */
+  if ( time(&nowbin) == ((time_t) - 1) )
+  {
+    /* free memory */
+    free(d_t_str);
+    d_t_str = NULL;
+    return NULL;
+  }
+  /* convert the time_t variable pointed to by the timer parameter to a tm structure,
+  expressed as local time. This function corrects for the local timezone
+  and any seasonal time adjustments. */
+  nowstruct = localtime(&nowbin);
+  if (strftime(d_t_str, DATE_TIME_FMT_LEN, fmt, nowstruct) == (size_t) 0)
+  {
+    /* free memory */
+    free(d_t_str);
+    d_t_str = NULL;
+    return NULL;
+  }
+
+  return d_t_str;
+}
+
+
+#ifdef LINUXOS
+/**********************************************
+Purpose:
+Get a password.
+It is recommended that users write their own getpass substitute.
+Return values:
+NULL - in case of an error
+**********************************************/
+ssize_t my_getpass (char **lineptr, size_t *n, FILE *stream)
+{
+  struct  termios old, new;
+  ssize_t nread;
+
+  /* Turn echoing off and fail if we can't. */
+  if ( tcgetattr(fileno(stream), &old) != 0 )
+    return -1;
+  new = old;
+  new.c_lflag &= ~ECHO;
+  if ( tcsetattr(fileno(stream), TCSAFLUSH, &new) != 0 )
+    return -1;
+
+  /* Read the password. */
+  nread = getline (lineptr, n, stream);
+
+  /* Restore terminal. */
+  (void) tcsetattr( fileno(stream), TCSAFLUSH, &old );
+
+  return nread;
+}
+#endif /* LINUXOS */
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Display help.
+**********************************************/
+/****************************************************/
+void help(char *prog_name)
+{
+  fprintf(stdout, "Usage:\n");
+  fprintf(stdout, "%s [-h] | [-v] | [[-c chunk_size] [-b batch_size] [-s sleep_time] ", prog_name);
+  fprintf(stdout, "[-d document_date(YYYYMMDD)] [-C from_cust_id-to_cust_id] [-n no_of_processes]]\n");
+}
+
+
+/****************************************************/
+/**********************************************
+Purpose:
+Display program version information.
+**********************************************/
+/****************************************************/
+void version(char *version_info)
+{
+  fprintf(stdout, "%s\n", version_info);
+}
+
+
+/****************************************************/
+/****************************************************/
+/****************************************************/

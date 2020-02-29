@@ -1,0 +1,15 @@
+include Makefile.common
+
+C = gcc
+#C = gcc323
+
+ProCConfig := config=bconv.linux.cfg
+#ProCDefine := define=LINUXOS
+
+CInclude := $(CInclude) -I/usr/lib/gcc-lib/i386-redhat-linux7/2.96/include/
+#CInclude := $(CInclude) -I/usr/lib/gcc-lib/i386-redhat-linux/3.2.3/include/
+
+FLAGS = -c -DLINUXOS
+
+linux: getbi.o common.o
+	$(C) -L$(ORAHOME)/lib -lclntsh -o $(EXECNAME) getbi.o common.o
